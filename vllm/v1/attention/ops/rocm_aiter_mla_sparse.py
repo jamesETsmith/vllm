@@ -380,6 +380,51 @@ def paged_mqa_logits_module():
     return None
 
 
+@functools.lru_cache
+def aiter_sparse_topk_decode():
+    if not envs.VLLM_ROCM_USE_AITER_SPARSE_TOPK:
+        return None
+    try:
+        from aiter.ops.topk import top_k_per_row_decode
+
+        return top_k_per_row_decode
+    except ImportError:
+        return None
+
+
+def top_k_per_row_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    top_k: int,
+) -> None:
+    num_rows = logits.shape[0]
+    aiter_topk = aiter_sparse_topk_decode()
+    if aiter_topk is not None:
+        aiter_topk(
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            top_k,
+        )
+        return
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -827,16 +872,11 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-        num_rows = logits.shape[0]
-
-        torch.ops._C.top_k_per_row_decode(
+        top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.seq_lens,
             topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
             topk_tokens,
         )
 

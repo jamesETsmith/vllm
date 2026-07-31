@@ -197,6 +197,23 @@ def _ragged_from_rows(
     )
 
 
+def _assert_topk_values_match(
+    logits: torch.Tensor,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    seq_lens: torch.Tensor,
+    next_n: int,
+) -> None:
+    for row in range(logits.shape[0]):
+        seq = row // next_n
+        offset = row % next_n
+        row_end = int(seq_lens[seq]) - next_n + offset + 1
+        k = min(actual.shape[1], row_end)
+        actual_values = logits[row, actual[row, :k].long()].sort(descending=True)[0]
+        expected_values = logits[row, expected[row, :k].long()].sort(descending=True)[0]
+        torch.testing.assert_close(actual_values, expected_values, atol=0, rtol=0)
+
+
 def _ref_combine_topk_swa_ragged(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -523,6 +540,56 @@ def test_sparse_attn_decode_split_k_kernel(
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("next_n", [1, 4])
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("padded_stride", [8192, 65536])
+@torch.inference_mode()
+def test_aiter_sparse_topk_decode(
+    monkeypatch, next_n: int, top_k: int, padded_stride: int
+) -> None:
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    batch_size = 4
+    num_rows = batch_size * next_n
+    seq_lens = torch.tensor(
+        [3000, 5000, 7000, 8000], dtype=torch.int32, device=device
+    )
+    logits = torch.full(
+        (num_rows, padded_stride),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    row_ids = torch.arange(num_rows, device=device)
+    row_ends = seq_lens[row_ids // next_n] - next_n + row_ids % next_n + 1
+    for row in range(num_rows):
+        logits[row, : int(row_ends[row])] = torch.randn(
+            int(row_ends[row]), dtype=torch.float32, device=device
+        )
+
+    expected = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        expected,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+
+    monkeypatch.setattr(mod.envs, "VLLM_ROCM_USE_AITER_SPARSE_TOPK", True)
+    mod.aiter_sparse_topk_decode.cache_clear()
+    actual = torch.empty_like(expected)
+    mod.top_k_per_row_decode(logits, next_n, seq_lens, actual, top_k)
+    torch.accelerator.synchronize()
+
+    _assert_topk_values_match(logits, actual, expected, seq_lens, next_n)
 
 
 # ---------------------------------------------------------------------------
