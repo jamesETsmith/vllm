@@ -501,14 +501,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        # KV cache groups whose KV is replicated on every DCP rank (DSpark draft).
+        cp_exempt_groups: list[int] = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence.
+            # tokens in the full, global (unsharded) sequence. Replicated groups keep
+            # the undivided block count instead.
+            group_cp_size = (
+                1
+                if getattr(spec, "non_causal_multi_token_decode", False)
+                else self.dcp_size
+            )
+            if group_cp_size != self.dcp_size:
+                cp_exempt_groups.append(len(block_sizes) - 1)
             max_num_blocks = cdiv(
-                block_table_max_model_len, spec.block_size * self.dcp_size
+                block_table_max_model_len, spec.block_size * group_cp_size
             )
             # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
             if isinstance(spec, MambaSpec):
@@ -552,6 +562,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            cp_exempt_groups=cp_exempt_groups,
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
