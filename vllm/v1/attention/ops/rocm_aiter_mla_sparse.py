@@ -607,6 +607,9 @@ def rocm_aiter_sparse_attn_indexer_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -627,6 +630,9 @@ def rocm_aiter_sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    dcp_rank: int = 0,
+    dcp_world_size: int = 1,
+    cp_kv_cache_interleave_size: int = 1,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -688,6 +694,9 @@ def rocm_aiter_sparse_attn_indexer(
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
@@ -758,6 +767,20 @@ def rocm_aiter_sparse_attn_indexer(
                 logits.stride(1),
                 topk_tokens,
             )
+            if dcp_world_size > 1:
+                from vllm.model_executor.layers.sparse_attn_indexer import (
+                    _merge_dcp_topk_global,
+                )
+
+                _merge_dcp_topk_global(
+                    logits,
+                    topk_indices,
+                    topk_tokens,
+                    dcp_rank,
+                    dcp_world_size,
+                    cp_kv_cache_interleave_size,
+                    row_starts=chunk.cu_seqlen_ks,
+                )
 
     if has_decode:
         decode_metadata = layer_attn_metadata.decode
@@ -807,6 +830,19 @@ def rocm_aiter_sparse_attn_indexer(
             logits.stride(1),
             topk_tokens,
         )
+        if dcp_world_size > 1:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                _merge_dcp_topk_global,
+            )
+
+            _merge_dcp_topk_global(
+                logits,
+                topk_indices,
+                topk_tokens,
+                dcp_rank,
+                dcp_world_size,
+                cp_kv_cache_interleave_size,
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack

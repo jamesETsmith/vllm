@@ -71,6 +71,98 @@ def _assert_cutedsl_dcp_merge_supported(
         )
 
 
+def _make_dcp_topk_candidates_torch(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    dcp_rank: int,
+    dcp_world_size: int,
+    cp_interleave: int,
+    row_starts: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack rank-local top-K scores and their global token ids in PyTorch."""
+    if cp_interleave < 1:
+        raise ValueError(f"cp_interleave must be positive, got {cp_interleave}")
+    if logits.ndim != 2 or topk_indices.ndim != 2:
+        raise ValueError("DCP top-K candidates require 2D logits and indices")
+    if logits.shape[0] != topk_indices.shape[0]:
+        raise ValueError("DCP top-K logits and indices must have the same row count")
+
+    valid = topk_indices >= 0
+    local_ids = topk_indices.to(torch.int64).clamp_min(0)
+    score_ids = local_ids
+    if row_starts is not None:
+        score_ids = score_ids + row_starts.to(torch.int64).reshape(-1, 1)
+    valid &= score_ids < logits.shape[1]
+    if logits.shape[1] == 0:
+        scores = torch.full(
+            topk_indices.shape,
+            float("-inf"),
+            dtype=torch.float32,
+            device=topk_indices.device,
+        )
+    else:
+        scores = logits.gather(1, score_ids.clamp_max(logits.shape[1] - 1)).float()
+        scores = scores.masked_fill(~valid, float("-inf"))
+
+    global_ids = (
+        (local_ids // cp_interleave) * (dcp_world_size * cp_interleave)
+        + dcp_rank * cp_interleave
+        + local_ids % cp_interleave
+    )
+    global_ids = torch.where(valid, global_ids, global_ids.new_full((), -1))
+    return scores.contiguous(), global_ids.to(torch.int32).contiguous()
+
+
+def _select_dcp_topk_candidates_torch(
+    candidate_scores: torch.Tensor,
+    candidate_token_ids: torch.Tensor,
+    topk_tokens: int,
+) -> torch.Tensor:
+    """Select global top-K, breaking equal-score ties by lower global token id.
+
+    The integer key preserves the total ordering of finite IEEE fp32 scores.
+    Sparse-indexer logits are expected to be finite; NaNs are treated as
+    ``-inf``. This matches the CuteDSL selector's deterministic tie rule.
+    """
+    if candidate_scores.shape != candidate_token_ids.shape:
+        raise ValueError("DCP candidate scores and token ids must have equal shapes")
+    if candidate_scores.ndim != 2:
+        raise ValueError("DCP candidates must be 2D")
+
+    valid = candidate_token_ids >= 0
+    scores = torch.nan_to_num(candidate_scores.float(), nan=float("-inf"))
+    bits = scores.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    sign = (bits >> 31) & 1
+    score_key = (
+        torch.where(sign.bool(), bits ^ 0xFFFFFFFF, bits ^ 0x80000000) & 0xFFFFFFFF
+    )
+    id_key = (~candidate_token_ids.to(torch.int64)) & 0xFFFFFFFF
+    key = (score_key << 32) | id_key
+    # Signed int64 topk needs the sign bit flipped to preserve unsigned order.
+    key = torch.where(
+        valid,
+        key ^ torch.iinfo(torch.int64).min,
+        key.new_full((), torch.iinfo(torch.int64).min),
+    )
+
+    select_k = min(topk_tokens, key.shape[1])
+    _, positions = torch.topk(key, select_k, dim=1, sorted=True)
+    selected = candidate_token_ids.gather(1, positions).to(torch.int32)
+    selected = selected.masked_fill(~valid.gather(1, positions), -1)
+    if select_k < topk_tokens:
+        selected = torch.cat(
+            (
+                selected,
+                selected.new_full(
+                    (selected.shape[0], topk_tokens - select_k),
+                    -1,
+                ),
+            ),
+            dim=1,
+        )
+    return selected
+
+
 def _merge_dcp_topk_global(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -95,32 +187,52 @@ def _merge_dcp_topk_global(
     if dcp_world_size <= 1:
         return
 
-    # CuteDSL-only path (no PyTorch fallback): Triton-pack each rank's
-    # (score, global_id) candidates on-device, all-gather, then the CuteDSL
-    # stable-topk selector.
-    _assert_cutedsl_dcp_merge_supported(logits, topk_indices, topk_tokens)
-    from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
-        pack_dcp_topk_candidates_cutedsl,
-        stable_topk_from_gathered_candidates_cutedsl,
-    )
+    if current_platform.is_cuda() and has_cutedsl():
+        _assert_cutedsl_dcp_merge_supported(logits, topk_indices, topk_tokens)
+        from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (
+            pack_dcp_topk_candidates_cutedsl,
+            stable_topk_from_gathered_candidates_cutedsl,
+        )
 
-    packed = torch.empty(
-        (*topk_indices.shape, 2),
-        dtype=torch.float32,
-        device=topk_indices.device,
-    )
-    pack_dcp_topk_candidates_cutedsl(
+        packed = torch.empty(
+            (*topk_indices.shape, 2),
+            dtype=torch.float32,
+            device=topk_indices.device,
+        )
+        pack_dcp_topk_candidates_cutedsl(
+            logits,
+            topk_indices,
+            packed,
+            dcp_rank,
+            dcp_world_size,
+            cp_interleave,
+            row_starts,
+        )
+        gathered = get_dcp_group().all_gather(packed, dim=1)
+        stable_topk_from_gathered_candidates_cutedsl(
+            gathered, topk_tokens, out=topk_indices
+        )
+        return
+
+    # Correctness-first ROCm/portable fallback. Keep ids as int32 instead of
+    # packing them into fp32: model positions above 2**24 must remain exact.
+    local_scores, local_ids = _make_dcp_topk_candidates_torch(
         logits,
         topk_indices,
-        packed,
         dcp_rank,
         dcp_world_size,
         cp_interleave,
         row_starts,
     )
-    gathered = get_dcp_group().all_gather(packed, dim=1)
-    stable_topk_from_gathered_candidates_cutedsl(
-        gathered, topk_tokens, out=topk_indices
+    dcp_group = get_dcp_group()
+    gathered_scores = dcp_group.all_gather(local_scores, dim=1)
+    gathered_ids = dcp_group.all_gather(local_ids, dim=1)
+    topk_indices.copy_(
+        _select_dcp_topk_candidates_torch(
+            gathered_scores,
+            gathered_ids,
+            topk_tokens,
+        )
     )
 
 
@@ -873,6 +985,9 @@ class SparseAttnIndexer(CustomOp):
                 self.max_total_seq_len,
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
+                dcp_rank=self.dcp_rank,
+                dcp_world_size=self.dcp_world_size,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "

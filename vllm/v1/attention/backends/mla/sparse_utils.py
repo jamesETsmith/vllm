@@ -7,6 +7,61 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+def localize_dcp_global_topk_torch(
+    req_id: torch.Tensor,
+    block_table: torch.Tensor,
+    global_token_ids: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    block_size: int,
+    cp_kv_cache_interleave_size: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Filter global top-K ids to one DCP rank and map them to physical slots.
+
+    This fixed-shape PyTorch fallback is intentionally portable to ROCm and CPU.
+    Valid slots are compacted to each row's prefix while ``-1`` fills the tail.
+    """
+    if dcp_size < 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"invalid DCP rank {dcp_rank} for world size {dcp_size}")
+    if cp_kv_cache_interleave_size != 1:
+        raise NotImplementedError(
+            "ROCm sparse DCP localization currently supports only "
+            "cp_kv_cache_interleave_size=1"
+        )
+    if req_id.dtype != torch.int32:
+        raise TypeError(f"req_id must be int32, got {req_id.dtype}")
+    if block_table.dtype != torch.int32:
+        raise TypeError(f"block_table must be int32, got {block_table.dtype}")
+    if global_token_ids.dtype != torch.int32:
+        raise TypeError(f"global_token_ids must be int32, got {global_token_ids.dtype}")
+    if req_id.shape[0] != global_token_ids.shape[0]:
+        raise ValueError("req_id and global_token_ids must have equal row counts")
+
+    ids = global_token_ids.to(torch.int64)
+    safe_ids = ids.clamp_min(0)
+    owner = safe_ids.remainder(dcp_size)
+    local_ids = torch.div(safe_ids, dcp_size, rounding_mode="floor")
+    logical_blocks = torch.div(local_ids, block_size, rounding_mode="floor")
+    offsets = local_ids.remainder(block_size)
+    valid = (ids >= 0) & (owner == dcp_rank) & (logical_blocks < block_table.shape[1])
+
+    req = req_id.to(torch.int64).reshape(-1, 1).expand_as(logical_blocks)
+    safe_blocks = logical_blocks.clamp_max(max(0, block_table.shape[1] - 1))
+    physical_blocks = block_table[req, safe_blocks]
+    physical_slots = physical_blocks.to(torch.int64) * block_size + offsets
+    physical_slots = torch.where(valid, physical_slots, physical_slots.new_full((), -1))
+
+    # Preserve global-topk order within each rank while moving invalid/remote
+    # entries behind the valid prefix. Stable argsort makes tie behavior explicit.
+    width = global_token_ids.shape[1]
+    positions = torch.arange(width, device=global_token_ids.device).reshape(1, -1)
+    compact_key = torch.where(valid, positions, positions + width)
+    order = torch.argsort(compact_key, dim=1, stable=True)
+    compact = physical_slots.gather(1, order).to(torch.int32).contiguous()
+    valid_counts = valid.sum(dim=1, dtype=torch.int32)
+    return compact, valid_counts
+
+
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
 def _convert_req_index_to_global_index_kernel(

@@ -155,6 +155,46 @@ def _ref_output(inputs: dict) -> torch.Tensor:
     )
 
 
+def _ref_lse(inputs: dict) -> torch.Tensor:
+    q = inputs["q"].float()
+    kv = inputs["kv_buffer"].squeeze(1).float()
+    indptr = inputs["kv_indptr"]
+    indices = inputs["kv_indices"]
+    rows = []
+    for row in range(q.shape[0]):
+        selected = indices[indptr[row] : indptr[row + 1]]
+        scores = torch.einsum("hd,kd->hk", q[row], kv[selected]) * SM_SCALE
+        rows.append(torch.logsumexp(scores, dim=-1))
+    return torch.stack(rows)
+
+
+@torch.inference_mode()
+def test_mla_decode_return_lse_contract() -> None:
+    """Native AITER LSE is FP32 natural-log with [tokens, heads] orientation."""
+    _require_aiter()
+    from aiter.mla import mla_decode_fwd
+
+    set_random_seed(0)
+    inputs = _make_inputs(batch_size=4, nhead=16, kv_seq_len=32)
+    _, lse = mla_decode_fwd(
+        inputs["q"],
+        inputs["kv_buffer"].view(-1, 1, 1, Q_HEAD_DIM),
+        inputs["o"],
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_indices"],
+        inputs["kv_last_page_lens"],
+        1,
+        sm_scale=SM_SCALE,
+        return_lse=True,
+    )
+
+    assert lse is not None
+    assert lse.dtype == torch.float32
+    assert lse.shape == (4, 16)
+    torch.testing.assert_close(lse, _ref_lse(inputs), atol=2e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("nhead", NUM_HEADS)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("kv_seq_len", KV_SEQ_LENS)
