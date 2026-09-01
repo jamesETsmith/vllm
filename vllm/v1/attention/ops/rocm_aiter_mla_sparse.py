@@ -1247,25 +1247,26 @@ def rocm_inv_rope_einsum(
     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
 
 
-_DSV4_SPARSE_NOPE_DIM = 448
-_DSV4_SPARSE_ROPE_DIM = 64
+_DSV4_SPARSE_DIMS = (448, 64)
+_HYV4_SPARSE_DIMS = (512, 64)
 
 
-def _validate_dsv4_sparse_dims(
+def _validate_sparse_dims(
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
     op_name: str,
+    allow_hyv4: bool = False,
 ) -> None:
     assert head_dim == nope_head_dim + rope_head_dim, (
         f"{op_name} expected head_dim={nope_head_dim + rope_head_dim}, got {head_dim}"
     )
-    assert (
-        nope_head_dim == _DSV4_SPARSE_NOPE_DIM
-        and rope_head_dim == _DSV4_SPARSE_ROPE_DIM
-    ), (
-        f"{op_name} expects {_DSV4_SPARSE_NOPE_DIM} NoPE dims and "
-        f"{_DSV4_SPARSE_ROPE_DIM} RoPE dims"
+    supported_dims = {_DSV4_SPARSE_DIMS}
+    if allow_hyv4:
+        supported_dims.add(_HYV4_SPARSE_DIMS)
+    assert (nope_head_dim, rope_head_dim) in supported_dims, (
+        f"{op_name} expects one of {sorted(supported_dims)}, got "
+        f"({nope_head_dim}, {rope_head_dim})"
     )
 
 
@@ -1369,11 +1370,13 @@ def _sparse_attn_prefill_ragged_kernel(
     out_stride_d,
     num_heads,
     head_dim,
+    value_dim,
     num_kv,
     scale,
     HAS_ATTN_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
@@ -1381,8 +1384,10 @@ def _sparse_attn_prefill_ragged_kernel(
 
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     dim_offsets = tl.arange(0, BLOCK_D)
+    value_offsets = tl.arange(0, BLOCK_V)
     head_mask = head_offsets < num_heads
     dim_mask = dim_offsets < head_dim
+    value_mask = value_offsets < value_dim
 
     q = tl.load(
         q_ptr
@@ -1396,7 +1401,7 @@ def _sparse_attn_prefill_ragged_kernel(
     neg_large = -3.4028234663852886e38
     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_V), dtype=tl.float32)
 
     kv_start = tl.load(kv_indptr_ptr + query_idx)
     kv_end = tl.load(kv_indptr_ptr + query_idx + 1)
@@ -1425,6 +1430,13 @@ def _sparse_attn_prefill_ragged_kernel(
             kv_indices_ptr + kv_start + next_k_pos, mask=next_k_pos < kv_len, other=-1
         )
 
+        values = tl.load(
+            kv_ptr
+            + safe_slot[:, None] * kv_stride_n
+            + value_offsets[None, :] * kv_stride_d,
+            mask=valid[:, None] & value_mask[None, :],
+            other=0.0,
+        )
         scores = tl.dot(q, tl.trans(kv)) * scale
         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
 
@@ -1435,7 +1447,7 @@ def _sparse_attn_prefill_ragged_kernel(
         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
         l_new = l_i * alpha + tl.sum(p, axis=1)
 
-        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        acc = acc * alpha[:, None] + tl.dot(p.to(values.dtype), values)
         m_i = m_new
         l_i = l_new
 
@@ -1460,9 +1472,9 @@ def _sparse_attn_prefill_ragged_kernel(
         out_ptr
         + query_idx * out_stride_t
         + head_offsets[:, None] * out_stride_h
-        + dim_offsets[None, :] * out_stride_d,
+        + value_offsets[None, :] * out_stride_d,
         out,
-        mask=head_mask[:, None] & dim_mask[None, :],
+        mask=head_mask[:, None] & value_mask[None, :],
     )
 
 
@@ -2554,9 +2566,14 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     attn_sink: torch.Tensor | None,
     nope_head_dim: int,
     rope_head_dim: int,
+    value_dim: int | None = None,
+    allow_hyv4: bool = False,
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
+    assert kv.shape[1] >= q.shape[2], (
+        f"expected KV width >= query width {q.shape[2]}, got {kv.shape[1]}"
+    )
     assert indices.ndim == 1, f"expected indices=[nnz], got {indices.shape}"
     assert indptr.ndim == 1, f"expected indptr=[sq+1], got {indptr.shape}"
     assert not q.is_cpu and not kv.is_cpu and not indices.is_cpu and not indptr.is_cpu
@@ -2570,21 +2587,29 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         attn_sink = attn_sink.contiguous()
 
     num_queries, num_heads, head_dim = q.shape
+    value_dim = head_dim if value_dim is None else value_dim
+    assert 0 < value_dim <= head_dim
     assert indptr.numel() == num_queries + 1, (
         f"expected indptr shape [{num_queries + 1}], got {indptr.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
         "_rocm_sparse_attn_prefill_ragged_triton",
+        allow_hyv4=allow_hyv4,
     )
 
     block_h = 16
     block_d = triton.next_power_of_2(head_dim)
+    block_v = triton.next_power_of_2(value_dim)
     block_k = 16 if head_dim >= 256 else 32
     num_warps = 4
-    out = torch.empty_like(q, dtype=torch.bfloat16)
+    out = torch.empty(
+        (num_queries, num_heads, value_dim),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
         q,
         kv,
@@ -2602,11 +2627,13 @@ def _rocm_sparse_attn_prefill_ragged_triton(
         out.stride(2),
         num_heads,
         head_dim,
+        value_dim,
         kv.shape[0],
         float(scale),
         HAS_ATTN_SINK=has_attn_sink,
         BLOCK_H=block_h,
         BLOCK_D=block_d,
+        BLOCK_V=block_v,
         BLOCK_K=block_k,
         num_warps=num_warps,
     )
@@ -2622,6 +2649,8 @@ def _rocm_sparse_attn_prefill_triton(
     nope_head_dim: int,
     rope_head_dim: int,
     topk_length: torch.Tensor | None = None,
+    value_dim: int | None = None,
+    allow_hyv4: bool = False,
 ) -> torch.Tensor:
     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
         indices,
@@ -2639,6 +2668,8 @@ def _rocm_sparse_attn_prefill_triton(
         attn_sink=attn_sink,
         nope_head_dim=nope_head_dim,
         rope_head_dim=rope_head_dim,
+        value_dim=value_dim,
+        allow_hyv4=allow_hyv4,
     )
 
 
@@ -2780,6 +2811,199 @@ def _decode_gfx950_num_splits(
     return num_splits
 
 
+@triton.jit
+def _hyv4_fp8_ds_mla_decode_kernel(
+    q_ptr,
+    cache_ptr,
+    indices_ptr,
+    indptr_ptr,
+    sink_ptr,
+    out_ptr,
+    q_stride0,
+    q_stride1,
+    cache_stride0,
+    cache_block_size,
+    out_stride0,
+    out_stride1,
+    num_cache_rows,
+    scale,
+    num_heads,
+    HAS_SINK: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    query_idx = tl.program_id(0)
+    head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    chunk_offsets = tl.arange(0, 128)
+    rope_offsets = tl.arange(0, 64)
+    q_row = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+    q0 = tl.load(q_row + chunk_offsets[None, :], mask=head_mask[:, None])
+    q1 = tl.load(q_row + 128 + chunk_offsets[None, :], mask=head_mask[:, None])
+    q2 = tl.load(q_row + 256 + chunk_offsets[None, :], mask=head_mask[:, None])
+    q3 = tl.load(q_row + 384 + chunk_offsets[None, :], mask=head_mask[:, None])
+    qr = tl.load(q_row + 512 + rope_offsets[None, :], mask=head_mask[:, None])
+
+    if HAS_SINK:
+        m_i = tl.load(sink_ptr + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
+        l_i = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+    else:
+        m_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    acc2 = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+    acc3 = tl.zeros((BLOCK_H, 128), dtype=tl.float32)
+
+    row_start = tl.load(indptr_ptr + query_idx)
+    row_end = tl.load(indptr_ptr + query_idx + 1)
+    row_len = row_end - row_start
+    k_offsets = tl.arange(0, BLOCK_K)
+    for k_start in tl.range(0, row_len, BLOCK_K):
+        positions = k_start + k_offsets
+        in_range = positions < row_len
+        slots = tl.load(indices_ptr + row_start + positions, mask=in_range, other=-1)
+        valid = in_range & (slots >= 0) & (slots < num_cache_rows)
+        safe_slots = tl.where(valid, slots, 0)
+        blocks = safe_slots // cache_block_size
+        offsets = safe_slots % cache_block_size
+        rows = cache_ptr + blocks.to(tl.int64) * cache_stride0 + offsets * 656
+        scales_ptr = (rows + 512).to(tl.pointer_type(tl.float32))
+
+        x0 = tl.load(
+            rows[:, None] + chunk_offsets[None, :], mask=valid[:, None], other=0
+        )
+        x1 = tl.load(
+            rows[:, None] + 128 + chunk_offsets[None, :],
+            mask=valid[:, None],
+            other=0,
+        )
+        x2 = tl.load(
+            rows[:, None] + 256 + chunk_offsets[None, :],
+            mask=valid[:, None],
+            other=0,
+        )
+        x3 = tl.load(
+            rows[:, None] + 384 + chunk_offsets[None, :],
+            mask=valid[:, None],
+            other=0,
+        )
+        s0 = tl.load(scales_ptr, mask=valid, other=0.0)
+        s1 = tl.load(scales_ptr + 1, mask=valid, other=0.0)
+        s2 = tl.load(scales_ptr + 2, mask=valid, other=0.0)
+        s3 = tl.load(scales_ptr + 3, mask=valid, other=0.0)
+        k0 = (x0.to(tl.float8e4nv, bitcast=True).to(tl.float32) * s0[:, None]).to(
+            tl.bfloat16
+        )
+        k1 = (x1.to(tl.float8e4nv, bitcast=True).to(tl.float32) * s1[:, None]).to(
+            tl.bfloat16
+        )
+        k2 = (x2.to(tl.float8e4nv, bitcast=True).to(tl.float32) * s2[:, None]).to(
+            tl.bfloat16
+        )
+        k3 = (x3.to(tl.float8e4nv, bitcast=True).to(tl.float32) * s3[:, None]).to(
+            tl.bfloat16
+        )
+        rope_ptr = (rows + 528).to(tl.pointer_type(tl.bfloat16))
+        kr = tl.load(
+            rope_ptr[:, None] + rope_offsets[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+
+        scores = tl.dot(q0, tl.trans(k0))
+        scores += tl.dot(q1, tl.trans(k1))
+        scores += tl.dot(q2, tl.trans(k2))
+        scores += tl.dot(q3, tl.trans(k3))
+        scores += tl.dot(qr, tl.trans(kr))
+        scores *= scale
+        scores = tl.where(
+            head_mask[:, None] & valid[None, :],
+            scores,
+            -3.4028234663852886e38,
+        )
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        probabilities = tl.exp(scores - m_new[:, None])
+        probabilities = tl.where(
+            head_mask[:, None] & valid[None, :], probabilities, 0.0
+        )
+        l_i = l_i * alpha + tl.sum(probabilities, axis=1)
+        probabilities = probabilities.to(tl.bfloat16)
+        acc0 = acc0 * alpha[:, None] + tl.dot(probabilities, k0)
+        acc1 = acc1 * alpha[:, None] + tl.dot(probabilities, k1)
+        acc2 = acc2 * alpha[:, None] + tl.dot(probabilities, k2)
+        acc3 = acc3 * alpha[:, None] + tl.dot(probabilities, k3)
+        m_i = m_new
+
+    denominator = tl.maximum(l_i, 1.0e-30)
+    out_row = out_ptr + query_idx * out_stride0 + head_offsets[:, None] * out_stride1
+    tl.store(
+        out_row + chunk_offsets[None, :],
+        acc0 / denominator[:, None],
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        out_row + 128 + chunk_offsets[None, :],
+        acc1 / denominator[:, None],
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        out_row + 256 + chunk_offsets[None, :],
+        acc2 / denominator[:, None],
+        mask=head_mask[:, None],
+    )
+    tl.store(
+        out_row + 384 + chunk_offsets[None, :],
+        acc3 / denominator[:, None],
+        mask=head_mask[:, None],
+    )
+
+
+def rocm_sparse_attn_decode_fp8_ds_mla(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    scale: float,
+    output: torch.Tensor,
+) -> None:
+    assert _ON_GFX950, "Hy4 fp8_ds_mla sparse decode requires gfx950"
+    assert q.dtype == torch.bfloat16 and q.shape[-1] == 576
+    assert kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 656
+    assert output.dtype == torch.bfloat16 and output.shape == (*q.shape[:-1], 512)
+    indices = _as_int32_contiguous_1d(indices)
+    indptr = _as_int32_contiguous_1d(indptr)
+    has_sink = attn_sink is not None
+    if attn_sink is None:
+        attn_sink = torch.empty(1, dtype=torch.float32, device=q.device)
+    else:
+        attn_sink = attn_sink.contiguous()
+    block_h = 8
+    _hyv4_fp8_ds_mla_decode_kernel[(q.shape[0], triton.cdiv(q.shape[1], block_h))](
+        q,
+        kv_cache,
+        indices,
+        indptr,
+        attn_sink,
+        output,
+        q.stride(0),
+        q.stride(1),
+        kv_cache.stride(0),
+        kv_cache.shape[1],
+        output.stride(0),
+        output.stride(1),
+        kv_cache.shape[0] * kv_cache.shape[1],
+        float(scale),
+        q.shape[1],
+        HAS_SINK=has_sink,
+        BLOCK_H=block_h,
+        BLOCK_K=16,
+        num_warps=8,
+    )
+
+
 def _rocm_sparse_attn_decode_ragged_triton(
     q: torch.Tensor,
     main_cache: torch.Tensor,
@@ -2823,7 +3047,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
     assert main_indptr.numel() == num_queries + 1, (
         f"expected main_indptr shape [{num_queries + 1}], got {main_indptr.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
@@ -3133,17 +3357,23 @@ def rocm_sparse_attn_prefill(
     rope_head_dim: int,
     attn_sink: torch.Tensor | None,
     output: torch.Tensor,
+    value_dim: int | None = None,
+    allow_hyv4: bool = False,
     ragged_indices: torch.Tensor | None = None,
     ragged_indptr: torch.Tensor | None = None,
 ) -> None:
     assert kv.ndim == 3 and kv.shape[1] == 1, (
         f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
     )
-    _validate_dsv4_sparse_dims(
+    assert output.ndim == 3 and output.shape[:2] == q.shape[:2]
+    value_dim = output.shape[-1] if value_dim is None else value_dim
+    assert output.shape[-1] == value_dim
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,
         "rocm_sparse_attn_prefill",
+        allow_hyv4=allow_hyv4,
     )
     if ragged_indices is not None and ragged_indptr is not None:
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
@@ -3155,6 +3385,8 @@ def rocm_sparse_attn_prefill(
             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
+            value_dim=value_dim,
+            allow_hyv4=allow_hyv4,
         )
     else:
         indices_2d = indices.reshape(indices.shape[0], -1)
@@ -3167,6 +3399,8 @@ def rocm_sparse_attn_prefill(
             nope_head_dim=nope_head_dim,
             rope_head_dim=rope_head_dim,
             topk_length=topk_length,
+            value_dim=value_dim,
+            allow_hyv4=allow_hyv4,
         )
     output.copy_(output_chunk.to(output.dtype))
 
@@ -3197,7 +3431,7 @@ def rocm_sparse_attn_decode(
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
         f"got {swa_k_cache.dtype}"
     )
-    _validate_dsv4_sparse_dims(
+    _validate_sparse_dims(
         head_dim,
         nope_head_dim,
         rope_head_dim,

@@ -7,6 +7,9 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.model_executor.layers.attention.mla_attention import (
+    _canonicalize_sparse_mla_kv_cache_dtype,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -269,7 +272,18 @@ def test_rocm_mtp_local_argmax_supports_graph_replay(default_vllm_config) -> Non
 def test_rocm_sparse_backend_preserves_name_and_supports_sink() -> None:
     assert HYV4ROCMAiterMLASparseBackend.get_name() == "ROCM_AITER_MLA_SPARSE"
     assert HYV4ROCMAiterMLASparseBackend.supports_sink()
+    assert "fp8_ds_mla" in HYV4ROCMAiterMLASparseBackend.supported_kv_cache_dtypes
     assert HYV4ROCMAiterMLASparseBackend.get_impl_cls() is HYV4ROCMAiterMLASparseImpl
+
+
+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3"])
+def test_rocm_sparse_backend_uses_packed_fp8_cache(cache_dtype: str) -> None:
+    assert (
+        _canonicalize_sparse_mla_kv_cache_dtype(
+            HYV4ROCMAiterMLASparseBackend, cache_dtype
+        )
+        == "fp8_ds_mla"
+    )
 
 
 def test_rocm_sparse_impl_reuses_validated_base_initialization() -> None:

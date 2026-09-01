@@ -49,6 +49,9 @@ requires_gfx950 = pytest.mark.skipif(
 NOPE_HEAD_DIM = 448
 ROPE_HEAD_DIM = 64
 HEAD_DIM = NOPE_HEAD_DIM + ROPE_HEAD_DIM
+HYV4_NOPE_HEAD_DIM = 512
+HYV4_HEAD_DIM = HYV4_NOPE_HEAD_DIM + ROPE_HEAD_DIM
+HYV4_CACHE_ENTRY_BYTES = 656
 
 
 def _ref_global_topk_ragged(
@@ -81,10 +84,12 @@ def _ref_sparse_prefill_ragged(
     rows: list[list[int]],
     scale: float,
     attn_sink: torch.Tensor | None,
+    value_dim: int | None = None,
 ) -> torch.Tensor:
     q_f32 = q.float()
     kv_f32 = kv.float()
-    out = torch.empty_like(q_f32)
+    value_dim = q.shape[-1] if value_dim is None else value_dim
+    out = q_f32.new_empty((*q.shape[:-1], value_dim))
 
     for query_idx in range(q.shape[0]):
         row_indices = rows[query_idx]
@@ -100,7 +105,7 @@ def _ref_sparse_prefill_ragged(
                 else:
                     probs = torch.softmax(scores, dim=0)
                 out[query_idx, head_idx] = torch.sum(
-                    probs[:, None] * selected_kv, dim=0
+                    probs[:, None] * selected_kv[:, :value_dim], dim=0
                 )
             else:
                 out[query_idx, head_idx] = 0
@@ -131,6 +136,35 @@ def _pack_fp8_ds_mla_cache(
         use_fnuz=use_fnuz,
     )
     return cache
+
+
+def _pack_hyv4_fp8_ds_mla_cache(kv: torch.Tensor, block_size: int) -> torch.Tensor:
+    num_tokens = kv.shape[0]
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    cache = torch.zeros(
+        (num_blocks, block_size, HYV4_CACHE_ENTRY_BYTES),
+        dtype=torch.uint8,
+        device=kv.device,
+    )
+    rows = cache.view(-1, HYV4_CACHE_ENTRY_BYTES)[:num_tokens]
+    nope = kv[:, :HYV4_NOPE_HEAD_DIM].float().view(num_tokens, 4, 128)
+    scales = nope.abs().amax(dim=-1).clamp(min=torch.finfo(torch.float32).tiny) / 448
+    quantized = (nope / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    rows[:, :512].copy_(quantized.view(num_tokens, 512).view(torch.uint8))
+    rows[:, 512:528].view(torch.float32).copy_(scales)
+    rows[:, 528:656].view(torch.bfloat16).copy_(kv[:, HYV4_NOPE_HEAD_DIM:])
+    return cache
+
+
+def _read_hyv4_fp8_ds_mla_cache_rows(
+    cache: torch.Tensor, slots: torch.Tensor, block_size: int
+) -> torch.Tensor:
+    rows = cache[slots // block_size, slots % block_size]
+    fp8 = rows[:, :512].contiguous().view(torch.float8_e4m3fn).float()
+    scales = rows[:, 512:528].contiguous().view(torch.float32)
+    nope = fp8 * scales.repeat_interleave(128, dim=1)
+    rope = rows[:, 528:656].contiguous().view(torch.bfloat16).float()
+    return torch.cat((nope, rope), dim=1)
 
 
 def _poison_fp8_ds_mla_cache_row(
@@ -444,6 +478,50 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
 
 
 @torch.inference_mode()
+def test_sparse_attn_prefill_ragged_kernel_hyv4_shape() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_prefill_ragged_triton,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(2)
+    nope_head_dim = 512
+    rope_head_dim = 64
+    head_dim = nope_head_dim + rope_head_dim
+    value_dim = 512
+    q = torch.randn(3, 3, head_dim, dtype=torch.bfloat16, device=device) * 0.125
+    kv = torch.randn(5, head_dim, dtype=torch.bfloat16, device=device) * 0.125
+    indices = torch.tensor([0, 2, 1, 3, 4], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 2, 5, 5], dtype=torch.int32, device=device)
+    attn_sink = torch.tensor([-0.25, 0.0, 0.25], dtype=torch.float32, device=device)
+    scale = head_dim**-0.5
+
+    actual = _rocm_sparse_attn_prefill_ragged_triton(
+        q=q,
+        kv=kv,
+        indices=indices,
+        indptr=indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=nope_head_dim,
+        rope_head_dim=rope_head_dim,
+        value_dim=value_dim,
+        allow_hyv4=True,
+    )
+    expected = _ref_sparse_prefill_ragged(
+        q,
+        kv,
+        [[0, 2], [1, 3, 4], []],
+        scale,
+        attn_sink,
+        value_dim=value_dim,
+    )
+
+    assert actual.shape == (3, 3, value_dim)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
 def test_sparse_attn_decode_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_decode_ragged_triton,
@@ -494,6 +572,59 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
 
     assert actual.data_ptr() == out.data_ptr()
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@requires_gfx950
+@torch.inference_mode()
+def test_hyv4_fp8_ds_mla_decode_matches_bf16_reference() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_sparse_attn_decode_fp8_ds_mla,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    block_size = 16
+    num_heads = 16
+    kv = torch.randn(19, HYV4_HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    cache = _pack_hyv4_fp8_ds_mla_cache(kv, block_size)
+    rows = [[0, 3, 7, -1, 18], [], [2, 6, 11, 17]]
+    indices, indptr = _ragged_from_rows(rows, device)
+    q = torch.randn(3, num_heads, HYV4_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    q *= 0.125
+    sinks = torch.linspace(-0.2, 0.2, num_heads, dtype=torch.float32, device=device)
+    output = torch.empty(
+        3, num_heads, HYV4_NOPE_HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+
+    rocm_sparse_attn_decode_fp8_ds_mla(
+        q=q,
+        kv_cache=cache,
+        indices=indices,
+        indptr=indptr,
+        attn_sink=sinks,
+        scale=HYV4_HEAD_DIM**-0.5,
+        output=output,
+    )
+
+    expected = torch.zeros_like(output)
+    for query_idx, row in enumerate(rows):
+        valid_row = [slot for slot in row if slot >= 0]
+        if not valid_row:
+            continue
+        slots = torch.tensor(valid_row, dtype=torch.int64, device=device)
+        selected = _read_hyv4_fp8_ds_mla_cache_rows(cache, slots, block_size)
+        for head_idx in range(num_heads):
+            scores = selected @ q[query_idx, head_idx].float()
+            scores *= HYV4_HEAD_DIM**-0.5
+            scores = torch.cat((scores, sinks[head_idx].reshape(1)))
+            probabilities = torch.softmax(scores, dim=0)[:-1]
+            expected[query_idx, head_idx] = (
+                probabilities[:, None] * selected[:, :HYV4_NOPE_HEAD_DIM]
+            ).sum(dim=0)
+
+    assert torch.isfinite(output).all()
+    assert torch.equal(output[1], torch.zeros_like(output[1]))
+    torch.testing.assert_close(output, expected, atol=0.03, rtol=0.03)
 
 
 @requires_gfx950

@@ -351,6 +351,11 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    if getattr(attn_backend, "use_fp8_ds_mla_layout", False) and kv_cache_dtype in (
+        "fp8",
+        "fp8_e4m3",
+    ):
+        return "fp8_ds_mla"
     if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
@@ -942,7 +947,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Convert from (N, B, L) to (B, N, L)
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if (
+                fp8_attention
+                and self.kv_cache_dtype != "fp8_ds_mla"
+                and self.impl.supports_quant_query_input
+            ):
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(

@@ -807,8 +807,6 @@ def test_concat_and_cache_ds_mla(
     seed: int,
     device: str,
 ) -> None:
-    if current_platform.is_rocm():
-        pytest.skip("concat_and_cache_mla doesn't support fp8_ds_mla on ROCm")
     if dtype.itemsize != 2:
         pytest.skip("ds_mla only supports 16-bit input")
     if kv_lora_rank != 512:
