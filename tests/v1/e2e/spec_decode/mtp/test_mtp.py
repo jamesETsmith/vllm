@@ -180,6 +180,7 @@ def test_mtp_correctness(
             extra_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
         elif "gemma-4" in model_name:
             extra_kwargs["limit_mm_per_prompt"] = {"image": 0, "audio": 0}
+            extra_kwargs["max_num_seqs"] = 128
 
         if draft_model is not None and "gemma-4" in draft_model:
             import transformers
