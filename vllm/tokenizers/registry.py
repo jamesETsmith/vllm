@@ -44,6 +44,7 @@ _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
     "internlm2",
     "step3_vl",
     "step3p7",
+    "step3p5v",
     "unlimited-ocr",
 }
 

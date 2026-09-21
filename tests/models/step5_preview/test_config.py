@@ -19,6 +19,7 @@ from vllm.models.step5_preview.model import (
     _is_sparse_indexer_weight,
     _validate_dense_fallback,
 )
+from vllm.tokenizers.registry import _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS
 from vllm.transformers_utils.config import get_config
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -98,6 +99,10 @@ def test_step5_preview_config_registry_resolves_local_checkpoint(tmp_path):
     assert isinstance(config, Step5PreviewConfig)
     assert isinstance(config.text_config, Step5PreviewTextConfig)
     assert isinstance(config.vision_config, Step5PreviewVisionConfig)
+
+
+def test_step5_preview_uses_generic_fast_tokenizer():
+    assert "step3p5v" in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS
 
 
 @pytest.mark.parametrize(
