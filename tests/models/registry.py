@@ -564,6 +564,27 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         # Initialize at least one MoE layer
         hf_overrides={"num_hidden_layers": 4},
     ),
+    "Step4ForCausalLM": _HfExamplesInfo(
+        "stepfun-ai/Step-3.5-Flash",
+        max_model_len=512,
+        use_original_num_layers=True,
+        hf_overrides={
+            "architectures": ["Step4ForCausalLM"],
+            "model_type": "step4",
+            "num_hidden_layers": 4,
+            "moe_num_experts": 8,
+            "moe_layers_enum": "3",
+            "head_dim": 192,
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "partial_rotary_factors": [1.0, 1.0, 1.0, 1 / 3],
+            "sparse_config": {"enabled": True},
+        },
+    ),
     "Step3TextForCausalLM": _HfExamplesInfo("stepfun-ai/step3", trust_remote_code=True),
     "SolarForCausalLM": _HfExamplesInfo(
         "upstage/solar-pro-preview-instruct", trust_remote_code=True
@@ -1439,6 +1460,27 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     ),
     "StepVLForConditionalGeneration": _HfExamplesInfo(
         "stepfun-ai/Step3-VL-10B", trust_remote_code=True
+    ),
+    "MMGPTStepRoboticsForCausalLM": _HfExamplesInfo(
+        "TypeSafeAI/Step-5-Preview-BF16",
+        max_model_len=512,
+        enforce_eager=True,
+        use_original_num_layers=True,
+        hf_overrides={
+            "text_config": {
+                "num_hidden_layers": 4,
+                "moe_num_experts": 8,
+                "moe_layers_enum": "3",
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "partial_rotary_factors": [1.0, 1.0, 1.0, 1 / 3],
+            },
+            "vision_config": {"layers": 1},
+        },
     ),
     "Step3p7ForConditionalGeneration": _HfExamplesInfo(
         "stepfun-ai/Step-3.7-Flash",

@@ -68,6 +68,22 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _get_rotary_dim(head_dim: int, partial_rotary_factor: float) -> int:
+    rotary_dim_float = head_dim * partial_rotary_factor
+    rotary_dim = round(rotary_dim_float)
+    if (
+        not 0 < rotary_dim <= head_dim
+        or rotary_dim % 2 != 0
+        or abs(rotary_dim_float - rotary_dim) > 1e-6
+    ):
+        raise ValueError(
+            "partial_rotary_factor must produce a positive, even integral rotary "
+            f"dimension no larger than head_dim, got head_dim={head_dim} and "
+            f"partial_rotary_factor={partial_rotary_factor}."
+        )
+    return rotary_dim
+
+
 class FP32ReplicatedLinear(ReplicatedLinear):
     """Use FP32 for higher precision."""
 
@@ -261,10 +277,7 @@ class Step3p5Attention(nn.Module):
         )
 
         self.max_position_embeddings = max_position
-        assert self.partial_rotary_factor == 1 or self.partial_rotary_factor == 0.5
-        self.rotary_dim = (
-            self.head_dim if self.partial_rotary_factor == 1 else self.head_dim // 2
-        )
+        self.rotary_dim = _get_rotary_dim(self.head_dim, self.partial_rotary_factor)
 
     def forward(
         self,

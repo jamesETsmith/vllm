@@ -208,6 +208,7 @@ _TEXT_GENERATION_MODELS = {
     "Step1ForCausalLM": ("step1", "Step1ForCausalLM"),
     "Step3TextForCausalLM": ("step3_text", "Step3TextForCausalLM"),
     "Step3p5ForCausalLM": ("step3p5", "Step3p5ForCausalLM"),
+    "Step4ForCausalLM": ("vllm.models.step5_preview", "Step4ForCausalLM"),
     "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
     "SolarForCausalLM": ("solar", "SolarForCausalLM"),
     "TeleChat2ForCausalLM": ("telechat2", "TeleChat2ForCausalLM"),
@@ -605,6 +606,10 @@ _MULTIMODAL_MODELS = {
     "RForConditionalGeneration": ("rvl", "RForConditionalGeneration"),
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
     "SmolVLMForConditionalGeneration": ("smolvlm", "SmolVLMForConditionalGeneration"),
+    "MMGPTStepRoboticsForCausalLM": (
+        "vllm.models.step5_preview",
+        "MMGPTStepRoboticsForCausalLM",
+    ),
     "StepVLForConditionalGeneration": ("step_vl", "StepVLForConditionalGeneration"),
     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),
     "Step3p7ForConditionalGeneration": ("step3p7", "Step3p7ForConditionalGeneration"),
