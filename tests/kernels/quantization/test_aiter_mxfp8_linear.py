@@ -74,6 +74,19 @@ def test_aiter_mxfp8_falls_back_when_unavailable():
     assert isinstance(kernel, RocmDotScaledMxfp8LinearKernel)
 
 
+def test_aiter_mxfp8_rejects_older_aiter_without_group32():
+    with (
+        patch.object(aiter_linear.current_platform, "is_rocm", return_value=True),
+        patch.object(aiter_linear.current_platform, "supports_mx", return_value=True),
+        patch.object(aiter_linear, "is_aiter_found_and_supported", return_value=True),
+        patch.object(aiter_linear, "_group32_gemm_available", return_value=False),
+    ):
+        supported, reason = AiterMxfp8LinearKernel.is_supported()
+
+    assert not supported
+    assert reason is not None and "group32" in reason
+
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_process_weights_preserves_scale_layout(compact):
     n, k = 64, 64

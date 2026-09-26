@@ -9,6 +9,9 @@ shape-tuned block32 kernel. Explicit ``--linear-backend aiter`` routes both
 layouts through AITER.
 """
 
+from importlib.util import find_spec
+from pathlib import Path
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -23,6 +26,23 @@ from vllm.platforms import current_platform
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 from .rocm_block32_gemm import rocm_mxfp8_block32_gemm
 from .rocm_native import _as_block32_scale
+
+
+def _group32_gemm_available() -> bool:
+    """Check for the AITER group32 module without importing AITER.
+
+    Importing AITER during backend discovery initializes HIP and can change
+    engine process-spawn behavior. The dedicated module was introduced with
+    the group32 public-dispatch contract, so its presence is a safe,
+    side-effect-free capability check.
+    """
+    spec = find_spec("aiter")
+    if spec is None or spec.submodule_search_locations is None:
+        return False
+    relative = Path("ops/triton/gemm/basic/gemm_a8w8_blockscale_group32.py")
+    return any(
+        (Path(root) / relative).is_file() for root in spec.submodule_search_locations
+    )
 
 
 class AiterMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -52,6 +72,8 @@ class AiterMxfp8LinearKernel(Mxfp8LinearKernel):
             return False, "native MX requires CDNA4 (gfx95x)"
         if not is_aiter_found_and_supported():
             return False, "AITER not found or not supported on the current platform"
+        if not _group32_gemm_available():
+            return False, "installed AITER does not provide the group32 MXFP8 GEMM"
         return True, None
 
     @classmethod
