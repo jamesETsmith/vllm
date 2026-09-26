@@ -45,6 +45,12 @@ def _group32_gemm_available() -> bool:
     )
 
 
+def _is_gfx950() -> bool:
+    from vllm.platforms.rocm import on_gfx950
+
+    return on_gfx950()
+
+
 class AiterMxfp8LinearKernel(Mxfp8LinearKernel):
     """Native MXFP8 linear using AITER's gfx950 group32 GEMM."""
 
@@ -70,6 +76,8 @@ class AiterMxfp8LinearKernel(Mxfp8LinearKernel):
             return False, "not ROCm"
         if not current_platform.supports_mx():
             return False, "native MX requires CDNA4 (gfx95x)"
+        if not _is_gfx950():
+            return False, "AITER group32 MXFP8 requires gfx950"
         if not is_aiter_found_and_supported():
             return False, "AITER not found or not supported on the current platform"
         if not _group32_gemm_available():
@@ -124,12 +132,12 @@ class AiterMxfp8LinearKernel(Mxfp8LinearKernel):
             )
         else:
             weight_group_rows = 32 if compact_scales else 1
-            out = rocm_aiter_ops.gemm_a8w8_blockscale(
+            out = rocm_aiter_ops.mxfp8_group32_gemm(
                 x_q,
                 layer.weight,
                 x_scale,
                 layer.weight_scale,
-                [weight_group_rows, MXFP8_BLOCK_SIZE],
+                weight_group_rows,
                 x.dtype,
             )
 

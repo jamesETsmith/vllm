@@ -957,6 +957,39 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
     return Y
 
 
+def _rocm_aiter_mxfp8_group32_gemm_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    weight_group_rows: int,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+        gemm_a8w8_blockscale_group32,
+    )
+
+    return gemm_a8w8_blockscale_group32(
+        A,
+        B,
+        As,
+        Bs,
+        dtype=output_dtype,
+        weight_group_rows=weight_group_rows,
+    )
+
+
+def _rocm_aiter_mxfp8_group32_gemm_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    weight_group_rows: int,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty(A.shape[0], B.shape[0], dtype=output_dtype, device=A.device)
+
+
 def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -2596,6 +2629,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_mxfp8_group32_gemm",
+                op_func=_rocm_aiter_mxfp8_group32_gemm_impl,
+                fake_impl=_rocm_aiter_mxfp8_group32_gemm_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_gemm_a8w8_blockscale_bpreshuffle",
                 op_func=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl,
                 fake_impl=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake,
@@ -2910,6 +2949,19 @@ class rocm_aiter_ops:
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale(
             A, B, As, Bs, output_dtype
+        )
+
+    @staticmethod
+    def mxfp8_group32_gemm(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        weight_group_rows: int,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_mxfp8_group32_gemm(
+            A, B, As, Bs, weight_group_rows, output_dtype
         )
 
     @staticmethod

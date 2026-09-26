@@ -78,6 +78,7 @@ def test_aiter_mxfp8_rejects_older_aiter_without_group32():
     with (
         patch.object(aiter_linear.current_platform, "is_rocm", return_value=True),
         patch.object(aiter_linear.current_platform, "supports_mx", return_value=True),
+        patch.object(aiter_linear, "_is_gfx950", return_value=True),
         patch.object(aiter_linear, "is_aiter_found_and_supported", return_value=True),
         patch.object(aiter_linear, "_group32_gemm_available", return_value=False),
     ):
@@ -85,6 +86,18 @@ def test_aiter_mxfp8_rejects_older_aiter_without_group32():
 
     assert not supported
     assert reason is not None and "group32" in reason
+
+
+def test_aiter_mxfp8_requires_gfx950():
+    with (
+        patch.object(aiter_linear.current_platform, "is_rocm", return_value=True),
+        patch.object(aiter_linear.current_platform, "supports_mx", return_value=True),
+        patch.object(aiter_linear, "_is_gfx950", return_value=False),
+    ):
+        supported, reason = AiterMxfp8LinearKernel.is_supported()
+
+    assert not supported
+    assert reason is not None and "gfx950" in reason
 
 
 @pytest.mark.parametrize("compact", [False, True])
@@ -117,7 +130,7 @@ def test_per_row_scales_use_aiter_and_restore_output_shape():
         patch.object(aiter_linear, "mxfp8_e4m3_quantize", return_value=(x_q, x_scale)),
         patch.object(
             aiter_linear.rocm_aiter_ops,
-            "gemm_a8w8_blockscale",
+            "mxfp8_group32_gemm",
             return_value=gemm_out,
         ) as gemm,
     ):
@@ -130,7 +143,7 @@ def test_per_row_scales_use_aiter_and_restore_output_shape():
         layer.weight,
         x_scale,
         layer.weight_scale,
-        [1, 32],
+        1,
         torch.bfloat16,
     )
 
@@ -154,7 +167,7 @@ def test_compact_scales_preserve_auto_path_and_support_explicit_aiter(force_aite
         ) as block32,
         patch.object(
             aiter_linear.rocm_aiter_ops,
-            "gemm_a8w8_blockscale",
+            "mxfp8_group32_gemm",
             return_value=expected,
         ) as gemm,
     ):
@@ -168,7 +181,7 @@ def test_compact_scales_preserve_auto_path_and_support_explicit_aiter(force_aite
             layer.weight,
             x_scale,
             layer.weight_scale,
-            [32, 32],
+            32,
             torch.bfloat16,
         )
     else:
