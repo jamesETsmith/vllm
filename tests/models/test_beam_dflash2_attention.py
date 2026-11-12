@@ -40,7 +40,9 @@ def _reference(q, kv, query_start_loc, seq_lens, block_table, scale, window, cau
 @pytest.mark.parametrize("window", [0, 4096, 37])
 @pytest.mark.parametrize("query_lens", [[6, 6, 6], [1, 16, 3, 40]])
 @pytest.mark.parametrize("hnd", [True, False])
-def test_split_kv_matches_reference(causal, window, query_lens, hnd):
+# Per-rank drafter heads at TP8 and TP4.
+@pytest.mark.parametrize("heads", [(5, 1), (10, 2)])
+def test_split_kv_matches_reference(causal, window, query_lens, hnd, heads):
     from vllm.models.beam.amd.dflash2_attention_ops import (
         dflash2_split_kv_attention,
         split_kv_workspace,
@@ -48,7 +50,7 @@ def test_split_kv_matches_reference(causal, window, query_lens, hnd):
 
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_heads, num_kv_heads, head_size, page_size = 5, 1, 128, 16
+    (num_heads, num_kv_heads), head_size, page_size = heads, 128, 16
     context_lens = [9000, 30, 5000, 0][: len(query_lens)]
     seq_lens = [c + q for c, q in zip(context_lens, query_lens)]
     max_pages = (max(seq_lens) + page_size - 1) // page_size
