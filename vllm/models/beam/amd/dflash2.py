@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCm hooks for the common Beam DFlash2 model."""
 
+import os
+
 import torch
 
 from vllm.config import VllmConfig
@@ -15,10 +17,18 @@ from ..common.dflash2 import (
     DFlash2BeamForCausalLM as CommonDFlash2BeamForCausalLM,
 )
 from .attention_ops import beam_qk_norm_rope
+from .dflash2_attention import BeamDFlash2AttentionBackend
 from .dflash2_context_ops import transform_context_kv
 
 
 class _AMDBackend:
+    # VLLM_BEAM_DFLASH2_SPLIT_KV=0 falls back to the platform-selected backend.
+    attn_backend = (
+        None
+        if os.environ.get("VLLM_BEAM_DFLASH2_SPLIT_KV", "1") == "0"
+        else BeamDFlash2AttentionBackend
+    )
+
     def configure_attention(self, attention: DFlash2BeamAttention) -> None:
         attn = attention.attn
         backend = attn.attn_backend

@@ -47,6 +47,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import refill_derived
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.worker.gpu.spec_decode.dflash2.config import DFlash2SpeculatorConfig
 
 logger = init_logger(__name__)
@@ -54,6 +55,9 @@ logger = init_logger(__name__)
 
 class DFlash2Backend(Protocol):
     """Platform hooks for attention and KV-cache layout differences."""
+
+    # Attention backend for the draft layers; None uses the platform default.
+    attn_backend: type[AttentionBackend] | None
 
     def configure_attention(self, attention: DFlash2BeamAttention) -> None: ...
 
@@ -135,6 +139,7 @@ class DFlash2BeamAttention(nn.Module):
             cache_config=cache_config,
             per_layer_sliding_window=config.sliding_window,
             prefix=f"{prefix}.attn",
+            attn_backend=backend.attn_backend,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
