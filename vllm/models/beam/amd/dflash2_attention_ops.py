@@ -10,7 +10,8 @@ the per-segment partials with log-sum-exp weights.
 
 KV cache: logical ``[num_blocks, num_kv_heads, block_size, 2 * head_size]``
 with K in ``[..., :head_size]`` and V in ``[..., head_size:]``; any stride
-order whose innermost dimension is contiguous is accepted.
+order whose innermost dimension is contiguous is accepted. The cache is the
+query dtype or per-tensor-scaled fp8.
 """
 
 import torch
@@ -32,6 +33,8 @@ def _dflash2_split_kv_partial(
     PART_O,
     PART_M,
     PART_L,
+    K_SCALE,
+    V_SCALE,
     scale_log2,
     stride_qt,
     stride_qh,
@@ -51,6 +54,7 @@ def _dflash2_split_kv_partial(
     BLOCK_Q: tl.constexpr,
     TILE_N: tl.constexpr,
     NUM_SEGMENTS: tl.constexpr,
+    FP8_KV: tl.constexpr,
 ):
     seq = tl.program_id(0) // num_q_blocks
     q_block = tl.program_id(0) % num_q_blocks
@@ -99,6 +103,11 @@ def _dflash2_split_kv_partial(
     acc = tl.zeros([BLOCK_M, HEAD_PAD], dtype=tl.float32)
     offs_n = tl.arange(0, TILE_N)
     bt_row = BLOCK_TABLE + seq.to(tl.int64) * stride_bt
+    # fp8 K/V is exact in the query dtype: fold k_scale into the logits and
+    # v_scale into the partial output.
+    qk_scale = scale_log2
+    if FP8_KV:
+        qk_scale = scale_log2 * tl.load(K_SCALE)
 
     for t in range(tile_begin, tile_end):
         pos = lo + t * TILE_N + offs_n
@@ -114,8 +123,11 @@ def _dflash2_split_kv_partial(
         v = tl.load(
             KV + base[:, None] + HEAD_SIZE + d[None, :], mask=kv_mask, other=0.0
         )
+        if FP8_KV:
+            k = k.to(q.dtype)
+            v = v.to(q.dtype)
 
-        s = tl.dot(q, tl.trans(k)) * scale_log2
+        s = tl.dot(q, tl.trans(k)) * qk_scale
         dist = q_pos[:, None] - pos[None, :]
         ok = row_ok[:, None] & kv_ok[None, :]
         if CAUSAL:
@@ -134,6 +146,8 @@ def _dflash2_split_kv_partial(
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m_i = m_new
 
+    if FP8_KV:
+        acc = acc * tl.load(V_SCALE)
     ml_off = (q_tok * num_heads + head) * NUM_SEGMENTS + segment
     tl.store(
         PART_O + ml_off[:, None] * HEAD_PAD + d[None, :],
@@ -237,11 +251,21 @@ def dflash2_split_kv_attention(
     causal: bool,
     workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     target_programs: int,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
-    """``query``/``output``: ``[num_tokens, num_heads, head_size]``."""
+    """``query``/``output``: ``[num_tokens, num_heads, head_size]``.
+
+    An fp8 ``kv_cache`` holds ``K / k_scale`` and ``V / v_scale``; the scales
+    are one-element fp32 tensors.
+    """
     num_tokens, num_heads, head_size = query.shape
     num_blocks, num_kv_heads, page_size, kv_dim = kv_cache.shape
     assert kv_dim == 2 * head_size and kv_cache.stride(-1) == 1
+    fp8_kv = kv_cache.dtype != query.dtype
+    if fp8_kv:
+        assert kv_cache.dtype.itemsize == 1 and kv_cache.dtype.is_floating_point
+        assert k_scale is not None and v_scale is not None
     assert query.stride(-1) == 1 and output.stride(-1) == 1
     assert num_heads % num_kv_heads == 0
     queries_per_kv = num_heads // num_kv_heads
@@ -272,6 +296,8 @@ def dflash2_split_kv_attention(
         part_o,
         part_m,
         part_l,
+        k_scale if fp8_kv else part_l,
+        v_scale if fp8_kv else part_l,
         scale * 1.4426950408889634,
         query.stride(0),
         query.stride(1),
@@ -291,6 +317,7 @@ def dflash2_split_kv_attention(
         BLOCK_Q=block_q,
         TILE_N=_TILE_N,
         NUM_SEGMENTS=num_segments,
+        FP8_KV=fp8_kv,
         num_warps=4,
         num_stages=1,
     )

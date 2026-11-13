@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCm hooks for the common Beam DFlash2 model."""
 
-import os
-
 import torch
 
 from vllm.config import VllmConfig
@@ -22,12 +20,14 @@ from .dflash2_context_ops import transform_context_kv
 
 
 class _AMDBackend:
-    # VLLM_BEAM_DFLASH2_SPLIT_KV=0 falls back to the platform-selected backend.
-    attn_backend = (
-        None
-        if os.environ.get("VLLM_BEAM_DFLASH2_SPLIT_KV", "1") == "0"
-        else BeamDFlash2AttentionBackend
-    )
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        # The drafter's attention_config.backend is the speculative config's
+        # attention_backend; an explicit choice there takes precedence.
+        self.attn_backend = (
+            None
+            if vllm_config.attention_config.backend is not None
+            else BeamDFlash2AttentionBackend
+        )
 
     def configure_attention(self, attention: DFlash2BeamAttention) -> None:
         attn = attention.attn
@@ -128,7 +128,11 @@ class _AMDBackend:
 
 class DFlash2BeamForCausalLM(CommonDFlash2BeamForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix, backend=_AMDBackend())
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            backend=_AMDBackend(vllm_config),
+        )
 
 
 __all__ = ["DFlash2BeamForCausalLM"]

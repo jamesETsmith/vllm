@@ -19,6 +19,7 @@ import torch
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -32,13 +33,14 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 from .dflash2_attention_ops import dflash2_split_kv_attention, split_kv_workspace
 
 # Workspace rows are (token, segment) pairs shared by every drafter layer;
 # layers run back to back on one stream, so reuse is safe.
 _MIN_WORKSPACE_ROWS = 16384
+_KV_CACHE_DTYPES: list[CacheDType] = ["auto", "bfloat16", "fp8", "fp8_e4m3"]
 _workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
@@ -67,7 +69,9 @@ class BeamDFlash2AttentionMetadata:
 class BeamDFlash2AttentionMetadataBuilder(
     AttentionMetadataBuilder[BeamDFlash2AttentionMetadata]
 ):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    # The grid and BLOCK_M come from the host max_query_len, so a captured
+    # graph is only valid for replays with the same per-request query length.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     # Metadata only references the speculator's persistent tensors.
     supports_draft_decode_metadata_update = True
 
@@ -110,12 +114,8 @@ class BeamDFlash2AttentionMetadataBuilder(
 
 
 class BeamDFlash2AttentionBackend(AttentionBackend):
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
-        "auto",
-        "float16",
-        "bfloat16",
-    ]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = _KV_CACHE_DTYPES
     forward_includes_kv_cache_update: bool = False
     supports_kv_cache_update_bypass: bool = True
 
@@ -175,7 +175,14 @@ class BeamDFlash2AttentionImpl(AttentionImpl[BeamDFlash2AttentionMetadata]):
             raise NotImplementedError("Beam DFlash2 attention has no softcap.")
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError("Beam DFlash2 attention is decoder-only.")
-        if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+        # The model passes this backend explicitly, which skips the selector's
+        # dtype validation, so check here.
+        model_dtype = get_current_vllm_config().model_config.dtype
+        if model_dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"Beam DFlash2 attention needs bfloat16, not {model_dtype}."
+            )
+        if kv_cache_dtype not in _KV_CACHE_DTYPES:
             raise NotImplementedError(
                 f"Beam DFlash2 attention has no {kv_cache_dtype} KV cache."
             )
@@ -218,6 +225,8 @@ class BeamDFlash2AttentionImpl(AttentionImpl[BeamDFlash2AttentionMetadata]):
         num_tokens = attn_metadata.num_actual_tokens
         query = query[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
         out = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
         dflash2_split_kv_attention(
             query,
             kv_cache,
@@ -232,6 +241,8 @@ class BeamDFlash2AttentionImpl(AttentionImpl[BeamDFlash2AttentionMetadata]):
             attn_metadata.causal,
             self.workspace,
             self.target_programs,
+            layer._k_scale,
+            layer._v_scale,
         )
         return output
 
